@@ -2,7 +2,9 @@ package main
 
 import (
 	litecoinCfg "github.com/ltcsuite/ltcd/chaincfg"
+	"github.com/roasbeef/btcd/chaincfg"
 	bitcoinCfg "github.com/roasbeef/btcd/chaincfg"
+	"github.com/roasbeef/btcd/chaincfg/chainhash"
 	"github.com/roasbeef/btcd/wire"
 )
 
@@ -29,6 +31,12 @@ type litecoinNetParams struct {
 var bitcoinTestNetParams = bitcoinNetParams{
 	Params:  &bitcoinCfg.TestNet3Params,
 	rpcPort: "18334",
+}
+
+// bitcoinMainNetParams contains parameters specific to the main network
+var bitcoinMainNetParams = bitcoinNetParams{
+	Params:  &bitcoinCfg.MainNetParams,
+	rpcPort: "8334",
 }
 
 // bitcoinSimNetParams contains parameters specific to the simulation test
@@ -69,11 +77,24 @@ func applyLitecoinParams(params *bitcoinNetParams) {
 	params.PrivateKeyID = liteTestNetParams.PrivateKeyID
 	params.WitnessPubKeyHashAddrID = liteTestNetParams.WitnessPubKeyHashAddrID
 	params.WitnessScriptHashAddrID = liteTestNetParams.WitnessScriptHashAddrID
+	params.Bech32HRPSegwit = liteTestNetParams.Bech32HRPSegwit
 
 	copy(params.HDPrivateKeyID[:], liteTestNetParams.HDPrivateKeyID[:])
 	copy(params.HDPublicKeyID[:], liteTestNetParams.HDPublicKeyID[:])
 
 	params.HDCoinType = liteTestNetParams.HDCoinType
+
+	checkPoints := make([]chaincfg.Checkpoint, len(liteTestNetParams.Checkpoints))
+	for i := 0; i < len(liteTestNetParams.Checkpoints); i++ {
+		var chainHash chainhash.Hash
+		copy(chainHash[:], liteTestNetParams.Checkpoints[i].Hash[:])
+
+		checkPoints[i] = chaincfg.Checkpoint{
+			Height: liteTestNetParams.Checkpoints[i].Height,
+			Hash:   &chainHash,
+		}
+	}
+	params.Checkpoints = checkPoints
 
 	params.rpcPort = liteTestNetParams.rpcPort
 }

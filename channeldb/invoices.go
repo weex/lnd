@@ -3,6 +3,7 @@ package channeldb
 import (
 	"bytes"
 	"crypto/sha256"
+	"encoding/binary"
 	"fmt"
 	"io"
 	"time"
@@ -43,6 +44,12 @@ const (
 	// MaxReceiptSize is the maximum size of the payment receipt stored
 	// within the database along side incoming/outgoing invoices.
 	MaxReceiptSize = 1024
+
+	// MaxPaymentRequestSize is the max size of a a payment request for
+	// this invoice.
+	// TODO(halseth): determine the max length payment request when field
+	// lengths are final.
+	MaxPaymentRequestSize = 4096
 )
 
 // ContractTerm is a companion struct to the Invoice struct. This struct houses
@@ -86,8 +93,15 @@ type Invoice struct {
 	// TODO(roasbeef): document scheme.
 	Receipt []byte
 
+	// PaymentRequest is an optional field where a payment request created
+	// for this invoice can be stored.
+	PaymentRequest []byte
+
 	// CreationDate is the exact time the invoice was created.
 	CreationDate time.Time
+
+	// SettleDate is the exact time the invoice was settled.
+	SettleDate time.Time
 
 	// Terms are the contractual payment terms of the invoice. Once
 	// all the terms have been satisfied by the payer, then the invoice can
@@ -107,6 +121,11 @@ func validateInvoice(i *Invoice) error {
 		return fmt.Errorf("max length a receipt is %v, and invoice "+
 			"of length %v was provided", MaxReceiptSize,
 			len(i.Receipt))
+	}
+	if len(i.PaymentRequest) > MaxPaymentRequestSize {
+		return fmt.Errorf("max length of payment request is %v, length "+
+			"provided was %v", MaxPaymentRequestSize,
+			len(i.PaymentRequest))
 	}
 	return nil
 }
@@ -306,12 +325,25 @@ func serializeInvoice(w io.Writer, i *Invoice) error {
 	if err := wire.WriteVarBytes(w, 0, i.Receipt[:]); err != nil {
 		return err
 	}
+	if err := wire.WriteVarBytes(w, 0, i.PaymentRequest[:]); err != nil {
+		return err
+	}
 
 	birthBytes, err := i.CreationDate.MarshalBinary()
 	if err != nil {
 		return err
 	}
+
 	if err := wire.WriteVarBytes(w, 0, birthBytes); err != nil {
+		return err
+	}
+
+	settleBytes, err := i.SettleDate.MarshalBinary()
+	if err != nil {
+		return err
+	}
+
+	if err := wire.WriteVarBytes(w, 0, settleBytes); err != nil {
 		return err
 	}
 
@@ -325,11 +357,7 @@ func serializeInvoice(w io.Writer, i *Invoice) error {
 		return err
 	}
 
-	var settleByte [1]byte
-	if i.Terms.Settled {
-		settleByte[0] = 1
-	}
-	if _, err := w.Write(settleByte[:]); err != nil {
+	if err := binary.Write(w, byteOrder, i.Terms.Settled); err != nil {
 		return err
 	}
 
@@ -361,11 +389,24 @@ func deserializeInvoice(r io.Reader) (*Invoice, error) {
 		return nil, err
 	}
 
+	invoice.PaymentRequest, err = wire.ReadVarBytes(r, 0, MaxPaymentRequestSize, "")
+	if err != nil {
+		return nil, err
+	}
+
 	birthBytes, err := wire.ReadVarBytes(r, 0, 300, "birth")
 	if err != nil {
 		return nil, err
 	}
 	if err := invoice.CreationDate.UnmarshalBinary(birthBytes); err != nil {
+		return nil, err
+	}
+
+	settledBytes, err := wire.ReadVarBytes(r, 0, 300, "settled")
+	if err != nil {
+		return nil, err
+	}
+	if err := invoice.SettleDate.UnmarshalBinary(settledBytes); err != nil {
 		return nil, err
 	}
 
@@ -378,12 +419,8 @@ func deserializeInvoice(r io.Reader) (*Invoice, error) {
 	}
 	invoice.Terms.Value = lnwire.MilliSatoshi(byteOrder.Uint64(scratch[:]))
 
-	var settleByte [1]byte
-	if _, err := io.ReadFull(r, settleByte[:]); err != nil {
+	if err := binary.Read(r, byteOrder, &invoice.Terms.Settled); err != nil {
 		return nil, err
-	}
-	if settleByte[0] == 1 {
-		invoice.Terms.Settled = true
 	}
 
 	return invoice, nil
@@ -396,13 +433,12 @@ func settleInvoice(invoices *bolt.Bucket, invoiceNum []byte) error {
 	}
 
 	invoice.Terms.Settled = true
+	invoice.SettleDate = time.Now()
 
 	var buf bytes.Buffer
 	if err := serializeInvoice(&buf, invoice); err != nil {
 		return nil
 	}
-
-	// TODO(roasbeef): add timestamp
 
 	return invoices.Put(invoiceNum[:], buf.Bytes())
 }

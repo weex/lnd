@@ -1,3 +1,7 @@
+// Copyright (c) 2013-2017 The btcsuite developers
+// Copyright (c) 2015-2016 The Decred developers
+// Copyright (C) 2015-2017 The Lightning Network Developers
+
 package main
 
 import (
@@ -34,7 +38,22 @@ const (
 	defaultPeerPort           = 9735
 	defaultRPCHost            = "localhost"
 	defaultMaxPendingChannels = 1
-	defaultNumChanConfs       = 1
+	defaultNoEncryptWallet    = false
+	defaultTrickleDelay       = 30 * 1000
+
+	// minTimeLockDelta is the minimum timelock we require for incoming
+	// HTLCs on our channels.
+	minTimeLockDelta = 4
+
+	defaultBitcoinMinHTLCMSat   = 1000
+	defaultBitcoinBaseFeeMSat   = 1000
+	defaultBitcoinFeeRate       = 1
+	defaultBitcoinTimeLockDelta = 144
+
+	defaultLitecoinMinHTLCMSat   = 1000
+	defaultLitecoinBaseFeeMSat   = 1000
+	defaultLitecoinFeeRate       = 1
+	defaultLitecoinTimeLockDelta = 576
 )
 
 var (
@@ -57,7 +76,7 @@ var (
 
 type chainConfig struct {
 	Active   bool   `long:"active" description:"If the chain should be active or not."`
-	ChainDir string `long:"chaindir" description:"The directory to store the chains's data within."`
+	ChainDir string `long:"chaindir" description:"The directory to store the chain's data within."`
 
 	RPCHost    string `long:"rpchost" description:"The daemon's rpc listening address. If a port is omitted, then the default port for the selected chain parameters will be used."`
 	RPCUser    string `long:"rpcuser" description:"Username for RPC connections"`
@@ -65,9 +84,17 @@ type chainConfig struct {
 	RPCCert    string `long:"rpccert" description:"File containing the daemon's certificate file"`
 	RawRPCCert string `long:"rawrpccert" description:"The raw bytes of the daemon's PEM-encoded certificate chain which will be used to authenticate the RPC connection."`
 
+	MainNet  bool `long:"mainnet" description:"Use the main network"`
 	TestNet3 bool `long:"testnet" description:"Use the test network"`
 	SimNet   bool `long:"simnet" description:"Use the simulation test network"`
 	RegTest  bool `long:"regtest" description:"Use the regression test network"`
+
+	DefaultNumChanConfs int                 `long:"defaultchanconfs" description:"The default number of confirmations a channel must have before it's considered open. If this is not set, we will scale the value according to the channel size."`
+	DefaultRemoteDelay  int                 `long:"defaultremotedelay" description:"The default number of blocks we will require our channel counterparty to wait before accessing its funds in case of unilateral close. If this is not set, we will scale the value according to the channel size."`
+	MinHTLC             lnwire.MilliSatoshi `long:"minhtlc" description:"The smallest HTLC we are willing to forward on our channels, in millisatoshi"`
+	BaseFee             lnwire.MilliSatoshi `long:"basefee" description:"The base fee in millisatoshi we will charge for forwarding payments on our channels"`
+	FeeRate             lnwire.MilliSatoshi `long:"feerate" description:"The fee rate used when forwarding payments on our channels. The total fee charged is basefee + (amount * feerate / 1000000), where amount is the forwarded amount."`
+	TimeLockDelta       uint32              `long:"timelockdelta" description:"The CLTV delta we will subtract from a forwarded HTLC's timelock value"`
 }
 
 type neutrinoConfig struct {
@@ -107,22 +134,29 @@ type config struct {
 
 	DebugLevel string `short:"d" long:"debuglevel" description:"Logging level for all subsystems {trace, debug, info, warn, error, critical} -- You may also specify <subsystem>=<level>,<subsystem2>=<level>,... to set the log level for individual subsystems -- Use show to list available subsystems"`
 
+	CPUProfile string `long:"cpuprofile" description:"Write CPU profile to the specified file"`
+
 	Profile string `long:"profile" description:"Enable HTTP profiling on given port -- NOTE port must be between 1024 and 65536"`
 
 	PeerPort           int  `long:"peerport" description:"The port to listen on for incoming p2p connections"`
 	RPCPort            int  `long:"rpcport" description:"The port for the rpc server"`
 	RESTPort           int  `long:"restport" description:"The port for the REST server"`
 	DebugHTLC          bool `long:"debughtlc" description:"Activate the debug htlc mode. With the debug HTLC mode, all payments sent use a pre-determined R-Hash. Additionally, all HTLCs sent to a node with the debug HTLC R-Hash are immediately settled in the next available state transition."`
+	HodlHTLC           bool `long:"hodlhtlc" description:"Activate the hodl HTLC mode.  With hodl HTLC mode, all incoming HTLCs will be accepted by the receiving node, but no attempt will be made to settle the payment with the sender."`
 	MaxPendingChannels int  `long:"maxpendingchannels" description:"The maximum number of incoming pending channels permitted per peer."`
 
 	Litecoin *chainConfig `group:"Litecoin" namespace:"litecoin"`
 	Bitcoin  *chainConfig `group:"Bitcoin" namespace:"bitcoin"`
 
-	DefaultNumChanConfs int `long:"defaultchanconfs" description:"The default number of confirmations a channel must have before it's considered open."`
-
 	NeutrinoMode *neutrinoConfig `group:"neutrino" namespace:"neutrino"`
 
 	Autopilot *autoPilotConfig `group:"autopilot" namespace:"autopilot"`
+
+	NoNetBootstrap bool `long:"nobootstrap" description:"If true, then automatic network bootstrapping will not be attempted."`
+
+	NoEncryptWallet bool `long:"noencryptwallet" description:"If set, wallet will be encrypted using the default passphrase."`
+
+	TrickleDelay int `long:"trickledelay" description:"Time in milliseconds between each release of announcements to the network"`
 }
 
 // loadConfig initializes and parses the config using a config file and command
@@ -135,31 +169,40 @@ type config struct {
 // 	4) Parse CLI options and overwrite/add any specified options
 func loadConfig() (*config, error) {
 	defaultCfg := config{
-		ConfigFile:          defaultConfigFile,
-		DataDir:             defaultDataDir,
-		DebugLevel:          defaultLogLevel,
-		TLSCertPath:         defaultTLSCertPath,
-		TLSKeyPath:          defaultTLSKeyPath,
-		AdminMacPath:        defaultAdminMacPath,
-		ReadMacPath:         defaultReadMacPath,
-		LogDir:              defaultLogDir,
-		PeerPort:            defaultPeerPort,
-		RPCPort:             defaultRPCPort,
-		RESTPort:            defaultRESTPort,
-		MaxPendingChannels:  defaultMaxPendingChannels,
-		DefaultNumChanConfs: defaultNumChanConfs,
+		ConfigFile:         defaultConfigFile,
+		DataDir:            defaultDataDir,
+		DebugLevel:         defaultLogLevel,
+		TLSCertPath:        defaultTLSCertPath,
+		TLSKeyPath:         defaultTLSKeyPath,
+		AdminMacPath:       defaultAdminMacPath,
+		ReadMacPath:        defaultReadMacPath,
+		LogDir:             defaultLogDir,
+		PeerPort:           defaultPeerPort,
+		RPCPort:            defaultRPCPort,
+		RESTPort:           defaultRESTPort,
+		MaxPendingChannels: defaultMaxPendingChannels,
+		NoEncryptWallet:    defaultNoEncryptWallet,
 		Bitcoin: &chainConfig{
-			RPCHost: defaultRPCHost,
-			RPCCert: defaultBtcdRPCCertFile,
+			RPCHost:       defaultRPCHost,
+			RPCCert:       defaultBtcdRPCCertFile,
+			MinHTLC:       defaultBitcoinMinHTLCMSat,
+			BaseFee:       defaultBitcoinBaseFeeMSat,
+			FeeRate:       defaultBitcoinFeeRate,
+			TimeLockDelta: defaultBitcoinTimeLockDelta,
 		},
 		Litecoin: &chainConfig{
-			RPCHost: defaultRPCHost,
-			RPCCert: defaultLtcdRPCCertFile,
+			RPCHost:       defaultRPCHost,
+			RPCCert:       defaultLtcdRPCCertFile,
+			MinHTLC:       defaultLitecoinMinHTLCMSat,
+			BaseFee:       defaultLitecoinBaseFeeMSat,
+			FeeRate:       defaultLitecoinFeeRate,
+			TimeLockDelta: defaultLitecoinTimeLockDelta,
 		},
 		Autopilot: &autoPilotConfig{
 			MaxChannels: 5,
 			Allocation:  0.6,
 		},
+		TrickleDelay: defaultTrickleDelay,
 	}
 
 	// Pre-parse the command line options to pick up an alternative config
@@ -218,25 +261,36 @@ func loadConfig() (*config, error) {
 		return nil, err
 	}
 
+	switch {
 	// The SPV mode implemented currently doesn't support Litecoin, so the
 	// two modes are incompatible.
-	if cfg.NeutrinoMode.Active && cfg.Litecoin.Active {
+	case cfg.NeutrinoMode.Active && cfg.Litecoin.Active:
 		str := "%s: The light client mode currently supported does " +
 			"not yet support execution on the Litecoin network"
 		err := fmt.Errorf(str, funcName)
 		return nil, err
-	}
 
-	if cfg.Litecoin.Active {
+	// Either Bitcoin must be active, or Litecoin must be active.
+	// Otherwise, we don't know which chain we're on.
+	case !cfg.Bitcoin.Active && !cfg.Litecoin.Active:
+		return nil, fmt.Errorf("either bitcoin.active or " +
+			"litecoin.active must be set to 1 (true)")
+
+	case cfg.Litecoin.Active:
 		if cfg.Litecoin.SimNet {
 			str := "%s: simnet mode for litecoin not currently supported"
 			return nil, fmt.Errorf(str, funcName)
 		}
 
+		if cfg.Litecoin.TimeLockDelta < minTimeLockDelta {
+			return nil, fmt.Errorf("timelockdelta must be at least %v",
+				minTimeLockDelta)
+		}
+
 		// The litecoin chain is the current active chain. However
-		// throuhgout the codebase we required chiancfg.Params. So as a
+		// throughout the codebase we required chiancfg.Params. So as a
 		// temporary hack, we'll mutate the default net params for
-		// bitcoin with the litecoin specific informat.ion
+		// bitcoin with the litecoin specific information.
 		paramCopy := bitcoinTestNetParams
 		applyLitecoinParams(&paramCopy)
 		activeNetParams = paramCopy
@@ -257,12 +311,16 @@ func loadConfig() (*config, error) {
 		// Finally we'll register the litecoin chain as our current
 		// primary chain.
 		registeredChains.RegisterPrimaryChain(litecoinChain)
-	}
-	if cfg.Bitcoin.Active {
+
+	case cfg.Bitcoin.Active:
 		// Multiple networks can't be selected simultaneously.  Count
 		// number of network flags passed; assign active network params
 		// while we're at it.
 		numNets := 0
+		if cfg.Bitcoin.MainNet {
+			numNets++
+			activeNetParams = bitcoinMainNetParams
+		}
 		if cfg.Bitcoin.TestNet3 {
 			numNets++
 			activeNetParams = bitcoinTestNetParams
@@ -272,6 +330,7 @@ func loadConfig() (*config, error) {
 			activeNetParams = regTestNetParams
 		}
 		if cfg.Bitcoin.SimNet {
+			numNets++
 			activeNetParams = bitcoinSimNetParams
 		}
 		if numNets > 1 {
@@ -279,6 +338,11 @@ func loadConfig() (*config, error) {
 				"used together -- choose one of the three"
 			err := fmt.Errorf(str, funcName)
 			return nil, err
+		}
+
+		if cfg.Bitcoin.TimeLockDelta < minTimeLockDelta {
+			return nil, fmt.Errorf("timelockdelta must be at least %v",
+				minTimeLockDelta)
 		}
 
 		if !cfg.NeutrinoMode.Active {
@@ -391,7 +455,7 @@ func cleanAndExpandPath(path string) string {
 // the levels accordingly. An appropriate error is returned if anything is
 // invalid.
 func parseAndSetDebugLevels(debugLevel string) error {
-	// When the specified string doesn't have any delimters, treat it as
+	// When the specified string doesn't have any delimiters, treat it as
 	// the log level for all subsystems.
 	if !strings.Contains(debugLevel, ",") && !strings.Contains(debugLevel, "=") {
 		// Validate debug log level.
@@ -481,8 +545,8 @@ func noiseDial(idPriv *btcec.PrivateKey) func(net.Addr) (net.Conn, error) {
 }
 
 func parseRPCParams(cConfig *chainConfig, net chainCode, funcName string) error {
-	// If the rpcuser and rpcpass paramters aren't set, then we'll attempt
-	// to automatically obtain the properm mcredentials for btcd and set
+	// If the rpcuser and rpcpass parameters aren't set, then we'll attempt
+	// to automatically obtain the proper credentials for btcd and set
 	// them within the configuration.
 	if cConfig.RPCUser != "" || cConfig.RPCPass != "" {
 		return nil
@@ -490,10 +554,10 @@ func parseRPCParams(cConfig *chainConfig, net chainCode, funcName string) error 
 
 	// If we're in simnet mode, then the running btcd instance won't read
 	// the RPC credentials from the configuration. So if lnd wasn't
-	// specified the paramters, then we won't be able to start.
+	// specified the parameters, then we won't be able to start.
 	if cConfig.SimNet {
 		str := "%v: rpcuser and rpcpass must be set to your btcd " +
-			"node's RPC paramters"
+			"node's RPC parameters for simnet mode"
 		return fmt.Errorf(str, funcName)
 	}
 

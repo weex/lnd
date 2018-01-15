@@ -1,3 +1,7 @@
+// Copyright (c) 2013-2017 The btcsuite developers
+// Copyright (c) 2015-2016 The Decred developers
+// Copyright (C) 2015-2017 The Lightning Network Developers
+
 package main
 
 import (
@@ -6,9 +10,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
-	"time"
 
-	"gopkg.in/macaroon-bakery.v1/bakery/checkers"
 	"gopkg.in/macaroon.v1"
 
 	"github.com/lightningnetwork/lnd/lnrpc"
@@ -34,6 +36,16 @@ var (
 func fatal(err error) {
 	fmt.Fprintf(os.Stderr, "[lncli] %v\n", err)
 	os.Exit(1)
+}
+
+func getWalletUnlockerClient(ctx *cli.Context) (lnrpc.WalletUnlockerClient, func()) {
+	conn := getClientConn(ctx)
+
+	cleanUp := func() {
+		conn.Close()
+	}
+
+	return lnrpc.NewWalletUnlockerClient(conn), cleanUp
 }
 
 func getClient(ctx *cli.Context) (lnrpc.LightningClient, func()) {
@@ -73,28 +85,35 @@ func getClientConn(ctx *cli.Context) *grpc.ClientConn {
 			fatal(err)
 		}
 
-		// We add a time-based constraint to prevent replay of the
-		// macaroon. It's good for 60 seconds by default to make up for
-		// any discrepancy between client and server clocks, but leaking
-		// the macaroon before it becomes invalid makes it possible for
-		// an attacker to reuse the macaroon. In addition, the validity
-		// time of the macaroon is extended by the time the server clock
-		// is behind the client clock, or shortened by the time the
-		// server clock is ahead of the client clock (or invalid
-		// altogether if, in the latter case, this time is more than 60
-		// seconds).
-		// TODO(aakselrod): add better anti-replay protection.
-		macaroonTimeout := time.Duration(ctx.GlobalInt64("macaroontimeout"))
-		requestTimeout := time.Now().Add(time.Second * macaroonTimeout)
-		timeCaveat := checkers.TimeBeforeCaveat(requestTimeout)
-		mac.AddFirstPartyCaveat(timeCaveat.Condition)
+		macConstraints := []macaroons.Constraint{
+			// We add a time-based constraint to prevent replay of the
+			// macaroon. It's good for 60 seconds by default to make up for
+			// any discrepancy between client and server clocks, but leaking
+			// the macaroon before it becomes invalid makes it possible for
+			// an attacker to reuse the macaroon. In addition, the validity
+			// time of the macaroon is extended by the time the server clock
+			// is behind the client clock, or shortened by the time the
+			// server clock is ahead of the client clock (or invalid
+			// altogether if, in the latter case, this time is more than 60
+			// seconds).
+			// TODO(aakselrod): add better anti-replay protection.
+			macaroons.TimeoutConstraint(ctx.GlobalInt64("macaroontimeout")),
+
+			// Lock macaroon down to a specific IP address.
+			macaroons.IPLockConstraint(ctx.GlobalString("macaroonip")),
+
+			// ... Add more constraints if needed.
+		}
+
+		// Apply constraints to the macaroon.
+		constrainedMac, err := macaroons.AddConstraints(mac, macConstraints...)
+		if err != nil {
+			fatal(err)
+		}
 
 		// Now we append the macaroon credentials to the dial options.
-		opts = append(
-			opts,
-			grpc.WithPerRPCCredentials(
-				macaroons.NewMacaroonCredential(mac)),
-		)
+		cred := macaroons.NewMacaroonCredential(constrainedMac)
+		opts = append(opts, grpc.WithPerRPCCredentials(cred))
 	}
 
 	conn, err := grpc.Dial(ctx.GlobalString("rpcserver"), opts...)
@@ -135,8 +154,14 @@ func main() {
 			Value: 60,
 			Usage: "anti-replay macaroon validity time in seconds",
 		},
+		cli.StringFlag{
+			Name:  "macaroonip",
+			Usage: "if set, lock macaroon to specific IP address",
+		},
 	}
 	app.Commands = []cli.Command{
+		createCommand,
+		unlockCommand,
 		newAddressCommand,
 		sendManyCommand,
 		sendCoinsCommand,
@@ -150,6 +175,7 @@ func main() {
 		getInfoCommand,
 		pendingChannelsCommand,
 		sendPaymentCommand,
+		payInvoiceCommand,
 		addInvoiceCommand,
 		lookupInvoiceCommand,
 		listInvoicesCommand,
@@ -167,7 +193,7 @@ func main() {
 		signMessageCommand,
 		verifyMessageCommand,
 		feeReportCommand,
-		updateFeesCommand,
+		updateChannelPolicyCommand,
 	}
 
 	if err := app.Run(os.Args); err != nil {

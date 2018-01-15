@@ -1,8 +1,10 @@
 package lnwire
 
 import (
+	"bytes"
 	"encoding/binary"
 	"fmt"
+	"image/color"
 	"io"
 	"math"
 
@@ -15,7 +17,7 @@ import (
 	"github.com/roasbeef/btcutil"
 )
 
-// MaxSliceLength is the maximum allowed lenth for any opaque byte slices in
+// MaxSliceLength is the maximum allowed length for any opaque byte slices in
 // the wire protocol.
 const MaxSliceLength = 65535
 
@@ -28,10 +30,46 @@ type PkScript []byte
 type addressType uint8
 
 const (
-	tcp4Addr  addressType = 1
-	tcp6Addr  addressType = 2
-	onionAddr addressType = 3
+	// noAddr denotes a blank address. An address of this type indicates
+	// that a node doesn't have any advertise d addresses.
+	noAddr addressType = 0
+
+	// tcp4Addr denotes an IPv4 TCP address.
+	tcp4Addr addressType = 1
+
+	// tcp4Addr denotes an IPv6 TCP address.
+	tcp6Addr addressType = 2
+
+	// v2OnionAddr denotes a version 2 Tor onion service address.
+	v2OnionAddr addressType = 3
+
+	// v3OnionAddr denotes a version 3 Tor (prop224) onion service
+	// addresses
+	v3OnionAddr addressType = 4
 )
+
+// AddrLen returns the number of bytes that it takes to encode the target
+// address.
+func (a addressType) AddrLen() uint16 {
+	switch a {
+	case noAddr:
+		return 0
+	case tcp4Addr:
+		return 6
+
+	case tcp6Addr:
+		return 18
+
+	case v2OnionAddr:
+		return 12
+
+	case v3OnionAddr:
+		return 37
+
+	default:
+		return 0
+	}
+}
 
 // writeElement is a one-stop shop to write the big endian representation of
 // any element which is to be serialized for the wire protocol. The passed
@@ -49,9 +87,21 @@ func writeElement(w io.Writer, element interface{}) error {
 		if _, err := w.Write(b[:]); err != nil {
 			return err
 		}
+	case FundingFlag:
+		var b [1]byte
+		b[0] = uint8(e)
+		if _, err := w.Write(b[:]); err != nil {
+			return err
+		}
 	case uint16:
 		var b [2]byte
 		binary.BigEndian.PutUint16(b[:], e)
+		if _, err := w.Write(b[:]); err != nil {
+			return err
+		}
+	case ChanUpdateFlag:
+		var b [2]byte
+		binary.BigEndian.PutUint16(b[:], uint16(e))
 		if _, err := w.Write(b[:]); err != nil {
 			return err
 		}
@@ -93,7 +143,6 @@ func writeElement(w io.Writer, element interface{}) error {
 		var b [33]byte
 		serializedPubkey := e.SerializeCompressed()
 		copy(b[:], serializedPubkey)
-		// TODO(roasbeef): use WriteVarBytes here?
 		if _, err := w.Write(b[:]); err != nil {
 			return err
 		}
@@ -116,7 +165,7 @@ func writeElement(w io.Writer, element interface{}) error {
 		}
 
 		var b [64]byte
-		err := serializeSigToWire(&b, e)
+		err := SerializeSigToWire(&b, e)
 		if err != nil {
 			return err
 		}
@@ -179,7 +228,7 @@ func writeElement(w io.Writer, element interface{}) error {
 		if err := wire.WriteVarBytes(w, 0, e); err != nil {
 			return err
 		}
-	case *FeatureVector:
+	case *RawFeatureVector:
 		if e == nil {
 			return fmt.Errorf("cannot write nil feature vector")
 		}
@@ -251,6 +300,7 @@ func writeElement(w io.Writer, element interface{}) error {
 			return fmt.Errorf("cannot write nil TCPAddr")
 		}
 
+		// TODO(roasbeef): account for onion types too
 		if e.IP.To4() != nil {
 			var descriptor [1]byte
 			descriptor[0] = uint8(tcp4Addr)
@@ -280,27 +330,37 @@ func writeElement(w io.Writer, element interface{}) error {
 		if _, err := w.Write(port[:]); err != nil {
 			return err
 		}
-	case []net.Addr:
-		// Write out the number of addresses.
-		if err := writeElement(w, uint16(len(e))); err != nil {
-			return err
-		}
 
-		// Append the actual addresses.
+	case []net.Addr:
+		// First, we'll encode all the addresses into an intermediate
+		// buffer. We need to do this in order to compute the total
+		// length of the addresses.
+		var addrBuf bytes.Buffer
 		for _, address := range e {
-			if err := writeElement(w, address); err != nil {
+			if err := writeElement(&addrBuf, address); err != nil {
 				return err
 			}
 		}
-	case RGB:
-		err := writeElements(w,
-			e.red,
-			e.green,
-			e.blue,
-		)
-		if err != nil {
+
+		// With the addresses fully encoded, we can now write out the
+		// number of bytes needed to encode them.
+		addrLen := addrBuf.Len()
+		if err := writeElement(w, uint16(addrLen)); err != nil {
 			return err
 		}
+
+		// Finally, we'll write out the raw addresses themselves, but
+		// only if we have any bytes to write.
+		if addrLen > 0 {
+			if _, err := w.Write(addrBuf.Bytes()); err != nil {
+				return err
+			}
+		}
+	case color.RGBA:
+		if err := writeElements(w, e.R, e.G, e.B); err != nil {
+			return err
+		}
+
 	case DeliveryAddress:
 		var length [2]byte
 		binary.BigEndian.PutUint16(length[:], uint16(len(e)))
@@ -341,12 +401,24 @@ func readElement(r io.Reader, element interface{}) error {
 			return err
 		}
 		*e = b[0]
+	case *FundingFlag:
+		var b [1]uint8
+		if _, err := r.Read(b[:]); err != nil {
+			return err
+		}
+		*e = FundingFlag(b[0])
 	case *uint16:
 		var b [2]byte
 		if _, err := io.ReadFull(r, b[:]); err != nil {
 			return err
 		}
 		*e = binary.BigEndian.Uint16(b[:])
+	case *ChanUpdateFlag:
+		var b [2]byte
+		if _, err := io.ReadFull(r, b[:]); err != nil {
+			return err
+		}
+		*e = ChanUpdateFlag(binary.BigEndian.Uint16(b[:]))
 	case *ErrorCode:
 		var b [2]byte
 		if _, err := io.ReadFull(r, b[:]); err != nil {
@@ -388,8 +460,9 @@ func readElement(r io.Reader, element interface{}) error {
 			return err
 		}
 		*e = pubKey
-	case **FeatureVector:
-		f, err := NewFeatureVectorFromReader(r)
+	case **RawFeatureVector:
+		f := NewRawFeatureVector()
+		err = f.Decode(r)
 		if err != nil {
 			return err
 		}
@@ -420,7 +493,7 @@ func readElement(r io.Reader, element interface{}) error {
 		if _, err := io.ReadFull(r, b[:]); err != nil {
 			return err
 		}
-		err = deserializeSigFromWire(e, b)
+		err = DeserializeSigFromWire(e, b)
 		if err != nil {
 			return err
 		}
@@ -503,7 +576,6 @@ func readElement(r io.Reader, element interface{}) error {
 		if err := readElement(r, (*uint16)(e)); err != nil {
 			return err
 		}
-
 	case *ChannelID:
 		if _, err := io.ReadFull(r, e[:]); err != nil {
 			return err
@@ -532,50 +604,97 @@ func readElement(r io.Reader, element interface{}) error {
 		}
 
 	case *[]net.Addr:
+		// First, we'll read the number of total bytes that have been
+		// used to encode the set of addresses.
 		var numAddrsBytes [2]byte
 		if _, err = io.ReadFull(r, numAddrsBytes[:]); err != nil {
 			return err
 		}
+		addrsLen := binary.BigEndian.Uint16(numAddrsBytes[:])
 
-		numAddrs := binary.BigEndian.Uint16(numAddrsBytes[:])
-		addresses := make([]net.Addr, 0, numAddrs)
+		// With the number of addresses, read, we'll now pull in the
+		// buffer of the encoded addresses into memory.
+		addrs := make([]byte, addrsLen)
+		if _, err := io.ReadFull(r, addrs[:]); err != nil {
+			return err
+		}
+		addrBuf := bytes.NewReader(addrs)
 
-		for i := 0; i < int(numAddrs); i++ {
+		// Finally, we'll parse the remaining address payload in
+		// series, using the first byte to denote how to decode the
+		// address itself.
+		var (
+			addresses     []net.Addr
+			addrBytesRead uint16
+		)
+		for addrBytesRead < addrsLen {
 			var descriptor [1]byte
-			if _, err = io.ReadFull(r, descriptor[:]); err != nil {
+			if _, err = io.ReadFull(addrBuf, descriptor[:]); err != nil {
 				return err
 			}
+
+			addrBytesRead++
 
 			address := &net.TCPAddr{}
-			switch descriptor[0] {
-			case 1:
+			aType := addressType(descriptor[0])
+			switch aType {
+
+			case noAddr:
+				addrBytesRead += aType.AddrLen()
+				continue
+
+			case tcp4Addr:
 				var ip [4]byte
-				if _, err = io.ReadFull(r, ip[:]); err != nil {
+				if _, err = io.ReadFull(addrBuf, ip[:]); err != nil {
 					return err
 				}
 				address.IP = (net.IP)(ip[:])
-			case 2:
+
+				var port [2]byte
+				if _, err = io.ReadFull(addrBuf, port[:]); err != nil {
+					return err
+				}
+
+				address.Port = int(binary.BigEndian.Uint16(port[:]))
+
+				addrBytesRead += aType.AddrLen()
+
+			case tcp6Addr:
 				var ip [16]byte
-				if _, err = io.ReadFull(r, ip[:]); err != nil {
+				if _, err = io.ReadFull(addrBuf, ip[:]); err != nil {
 					return err
 				}
 				address.IP = (net.IP)(ip[:])
+
+				var port [2]byte
+				if _, err = io.ReadFull(addrBuf, port[:]); err != nil {
+					return err
+				}
+				address.Port = int(binary.BigEndian.Uint16(port[:]))
+
+				addrBytesRead += aType.AddrLen()
+
+			case v2OnionAddr:
+				addrBytesRead += aType.AddrLen()
+				continue
+
+			case v3OnionAddr:
+				addrBytesRead += aType.AddrLen()
+				continue
+
+			default:
+				return fmt.Errorf("unknown address type: %v", aType)
 			}
 
-			var port [2]byte
-			if _, err = io.ReadFull(r, port[:]); err != nil {
-				return err
-			}
-
-			address.Port = int(binary.BigEndian.Uint16(port[:]))
 			addresses = append(addresses, address)
 		}
+
 		*e = addresses
-	case *RGB:
+	case *color.RGBA:
 		err := readElements(r,
-			&e.red,
-			&e.green,
-			&e.blue,
+			&e.R,
+			&e.G,
+			&e.B,
 		)
 		if err != nil {
 			return err
@@ -588,6 +707,9 @@ func readElement(r io.Reader, element interface{}) error {
 		length := binary.BigEndian.Uint16(addrLen[:])
 
 		var addrBytes [34]byte
+		if length > 34 {
+			return fmt.Errorf("Cannot read %d bytes into addrBytes", length)
+		}
 		if _, err = io.ReadFull(r, addrBytes[:length]); err != nil {
 			return err
 		}

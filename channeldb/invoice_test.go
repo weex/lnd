@@ -12,14 +12,15 @@ import (
 )
 
 func randInvoice(value lnwire.MilliSatoshi) (*Invoice, error) {
-
 	var pre [32]byte
 	if _, err := rand.Read(pre[:]); err != nil {
 		return nil, err
 	}
 
 	i := &Invoice{
-		CreationDate: time.Now(),
+		// Use single second precision to avoid false positive test
+		// failures due to the monotonic time component.
+		CreationDate: time.Unix(time.Now().Unix(), 0),
 		Terms: ContractTerm{
 			PaymentPreimage: pre,
 			Value:           value,
@@ -27,6 +28,19 @@ func randInvoice(value lnwire.MilliSatoshi) (*Invoice, error) {
 	}
 	i.Memo = []byte("memo")
 	i.Receipt = []byte("recipt")
+
+	// Create a random byte slice of MaxPaymentRequestSize bytes to be used
+	// as a dummy paymentrequest, and  determine if it should be set based
+	// on one of the random bytes.
+	var r [MaxPaymentRequestSize]byte
+	if _, err := rand.Read(r[:]); err != nil {
+		return nil, err
+	}
+	if r[0]&1 == 0 {
+		i.PaymentRequest = r[:]
+	} else {
+		i.PaymentRequest = []byte("")
+	}
 
 	return i, nil
 }
@@ -43,10 +57,13 @@ func TestInvoiceWorkflow(t *testing.T) {
 	// Create a fake invoice which we'll use several times in the tests
 	// below.
 	fakeInvoice := &Invoice{
-		CreationDate: time.Now(),
+		// Use single second precision to avoid false positive test
+		// failures due to the monotonic time component.
+		CreationDate: time.Unix(time.Now().Unix(), 0),
 	}
 	fakeInvoice.Memo = []byte("memo")
 	fakeInvoice.Receipt = []byte("recipt")
+	fakeInvoice.PaymentRequest = []byte("")
 	copy(fakeInvoice.Terms.PaymentPreimage[:], rev[:])
 	fakeInvoice.Terms.Value = lnwire.NewMSatFromSatoshis(10000)
 
@@ -70,8 +87,9 @@ func TestInvoiceWorkflow(t *testing.T) {
 			spew.Sdump(fakeInvoice), spew.Sdump(dbInvoice))
 	}
 
-	// Settle the invoice, the versin retreived from the database should
-	// now have the settled bit toggle to true.
+	// Settle the invoice, the version retrieved from the database should
+	// now have the settled bit toggle to true and a non-default
+	// SettledDate
 	if err := db.SettleInvoice(paymentHash); err != nil {
 		t.Fatalf("unable to settle invoice: %v", err)
 	}
@@ -83,6 +101,10 @@ func TestInvoiceWorkflow(t *testing.T) {
 		t.Fatalf("invoice should now be settled but isn't")
 	}
 
+	if dbInvoice2.SettleDate.IsZero() {
+		t.Fatalf("invoice should have non-zero SettledDate but isn't")
+	}
+
 	// Attempt to insert generated above again, this should fail as
 	// duplicates are rejected by the processing logic.
 	if err := db.AddInvoice(fakeInvoice); err != ErrDuplicateInvoice {
@@ -90,7 +112,7 @@ func TestInvoiceWorkflow(t *testing.T) {
 			"instead %v", err)
 	}
 
-	// Attempt to look up a non-existant invoice, this should also fail but
+	// Attempt to look up a non-existent invoice, this should also fail but
 	// with a "not found" error.
 	var fakeHash [32]byte
 	if _, err := db.LookupInvoice(fakeHash); err != ErrInvoiceNotFound {

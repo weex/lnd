@@ -18,43 +18,26 @@ import (
 	"github.com/lightningnetwork/lnd/htlcswitch"
 	"github.com/lightningnetwork/lnd/lnwallet"
 	"github.com/lightningnetwork/lnd/lnwallet/btcwallet"
-	"github.com/lightningnetwork/lnd/lnwire"
 	"github.com/lightningnetwork/lnd/routing/chainview"
 	"github.com/roasbeef/btcd/chaincfg/chainhash"
-	"github.com/roasbeef/btcrpcclient"
+	"github.com/roasbeef/btcd/rpcclient"
+	"github.com/roasbeef/btcutil"
 	"github.com/roasbeef/btcwallet/chain"
 	"github.com/roasbeef/btcwallet/walletdb"
 )
-
-// defaultBitcoinForwardingPolicy is the default forwarding policy used for
-// Bitcoin channels.
-var defaultBitcoinForwardingPolicy = htlcswitch.ForwardingPolicy{
-	MinHTLC:       0,
-	BaseFee:       lnwire.NewMSatFromSatoshis(1),
-	FeeRate:       1,
-	TimeLockDelta: 144,
-}
-
-// defaultLitecoinForwardingPolicy is the default forwarding policy used for
-// Litecoin channels.
-var defaultLitecoinForwardingPolicy = htlcswitch.ForwardingPolicy{
-	MinHTLC:       0,
-	BaseFee:       1,
-	FeeRate:       1,
-	TimeLockDelta: 576,
-}
 
 // defaultChannelConstraints is the default set of channel constraints that are
 // meant to be used when initially funding a channel.
 //
 // TODO(roasbeef): have one for both chains
+// TODO(halseth): make configurable at startup?
 var defaultChannelConstraints = channeldb.ChannelConstraints{
 	DustLimit:        lnwallet.DefaultDustLimit(),
 	MaxAcceptedHtlcs: lnwallet.MaxHTLCNumber / 2,
 }
 
-// chainCode is an enum-like structure for keeping track of the chains currently
-// supported within lnd.
+// chainCode is an enum-like structure for keeping track of the chains
+// currently supported within lnd.
 type chainCode uint32
 
 const (
@@ -102,7 +85,9 @@ type chainControl struct {
 // according to the parameters in the passed lnd configuration. Currently two
 // branches of chainControl instances exist: one backed by a running btcd
 // full-node, and the other backed by a running neutrino light client instance.
-func newChainControlFromConfig(cfg *config, chanDB *channeldb.DB) (*chainControl, func(), error) {
+func newChainControlFromConfig(cfg *config, chanDB *channeldb.DB,
+	privateWalletPw, publicWalletPw []byte) (*chainControl, func(), error) {
+
 	// Set the RPC config from the "home" chain. Multi-chain isn't yet
 	// active, so we'll restrict usage to a particular chain for now.
 	homeChainConfig := cfg.Bitcoin
@@ -112,34 +97,49 @@ func newChainControlFromConfig(cfg *config, chanDB *channeldb.DB) (*chainControl
 	ltndLog.Infof("Primary chain is set to: %v",
 		registeredChains.PrimaryChain())
 
-	estimator := lnwallet.StaticFeeEstimator{FeeRate: 50}
-	walletConfig := &btcwallet.Config{
-		PrivatePass:  []byte("hello"),
-		DataDir:      homeChainConfig.ChainDir,
-		NetParams:    activeNetParams.Params,
-		FeeEstimator: estimator,
-	}
-
-	cc := &chainControl{
-		feeEstimator: estimator,
-	}
+	cc := &chainControl{}
 
 	switch registeredChains.PrimaryChain() {
 	case bitcoinChain:
-		cc.routingPolicy = defaultBitcoinForwardingPolicy
+		cc.routingPolicy = htlcswitch.ForwardingPolicy{
+			MinHTLC:       cfg.Bitcoin.MinHTLC,
+			BaseFee:       cfg.Bitcoin.BaseFee,
+			FeeRate:       cfg.Bitcoin.FeeRate,
+			TimeLockDelta: cfg.Bitcoin.TimeLockDelta,
+		}
+		cc.feeEstimator = lnwallet.StaticFeeEstimator{
+			FeeRate: 200,
+		}
 	case litecoinChain:
-		cc.routingPolicy = defaultLitecoinForwardingPolicy
+		cc.routingPolicy = htlcswitch.ForwardingPolicy{
+			MinHTLC:       cfg.Litecoin.MinHTLC,
+			BaseFee:       cfg.Litecoin.BaseFee,
+			FeeRate:       cfg.Litecoin.FeeRate,
+			TimeLockDelta: cfg.Litecoin.TimeLockDelta,
+		}
+		cc.feeEstimator = lnwallet.StaticFeeEstimator{
+			FeeRate: 100,
+		}
 	default:
 		return nil, nil, fmt.Errorf("Default routing policy for "+
 			"chain %v is unknown", registeredChains.PrimaryChain())
 	}
 
+	walletConfig := &btcwallet.Config{
+		PrivatePass:  privateWalletPw,
+		PublicPass:   publicWalletPw,
+		DataDir:      homeChainConfig.ChainDir,
+		NetParams:    activeNetParams.Params,
+		FeeEstimator: cc.feeEstimator,
+	}
+
 	var (
-		err     error
-		cleanUp func()
+		err        error
+		cleanUp    func()
+		rawRPCConn *chain.RPCClient
 	)
 
-	// If spv mode is active, then we'll be using a distimnct set of
+	// If spv mode is active, then we'll be using a distinct set of
 	// chainControl interfaces that interface directly with the p2p network
 	// of the selected chain.
 	if cfg.NeutrinoMode.Active {
@@ -230,7 +230,7 @@ func newChainControlFromConfig(cfg *config, chanDB *channeldb.DB) (*chainControl
 
 		btcdUser := homeChainConfig.RPCUser
 		btcdPass := homeChainConfig.RPCPass
-		rpcConfig := &btcrpcclient.ConnConfig{
+		rpcConfig := &rpcclient.ConnConfig{
 			Host:                 btcdHost,
 			Endpoint:             "ws",
 			User:                 btcdUser,
@@ -262,6 +262,30 @@ func newChainControlFromConfig(cfg *config, chanDB *channeldb.DB) (*chainControl
 		}
 
 		walletConfig.ChainSource = chainRPC
+		rawRPCConn = chainRPC
+
+		// If we're not in simnet or regtest mode, then we'll attempt
+		// to use a proper fee estimator for testnet.
+		if !cfg.Bitcoin.SimNet && !cfg.Litecoin.SimNet &&
+			!cfg.Bitcoin.RegTest && !cfg.Litecoin.RegTest {
+
+			ltndLog.Infof("Initializing btcd backed fee estimator")
+
+			// Finally, we'll re-initialize the fee estimator, as
+			// if we're using btcd as a backend, then we can use
+			// live fee estimates, rather than a statically coded
+			// value.
+			fallBackFeeRate := btcutil.Amount(140)
+			cc.feeEstimator, err = lnwallet.NewBtcdFeeEstimator(
+				*rpcConfig, fallBackFeeRate,
+			)
+			if err != nil {
+				return nil, nil, err
+			}
+			if err := cc.feeEstimator.Start(); err != nil {
+				return nil, nil, err
+			}
+		}
 	}
 
 	wc, err := btcwallet.New(*walletConfig)
@@ -300,16 +324,45 @@ func newChainControlFromConfig(cfg *config, chanDB *channeldb.DB) (*chainControl
 
 	cc.wallet = wallet
 
+	// As a final check, if we're using the RPC backend, we'll ensure that
+	// the btcd node has the txindex set. Atm, this is required in order to
+	// properly perform historical confirmation+spend dispatches.
+	if !cfg.NeutrinoMode.Active {
+		// In order to check to see if we have the txindex up to date
+		// and active, we'll try to fetch the first transaction in the
+		// latest block via the index. If this doesn't succeed, then we
+		// know it isn't active (or just not yet up to date).
+		bestHash, _, err := cc.chainIO.GetBestBlock()
+		if err != nil {
+			return nil, nil, fmt.Errorf("unable to get current "+
+				"best hash: %v", err)
+		}
+		bestBlock, err := cc.chainIO.GetBlock(bestHash)
+		if err != nil {
+			return nil, nil, fmt.Errorf("unable to get current "+
+				"block hash: %v", err)
+		}
+
+		firstTxHash := bestBlock.Transactions[0].TxHash()
+		_, err = rawRPCConn.GetRawTransaction(&firstTxHash)
+		if err != nil {
+			// If the node doesn't have the txindex set, then we'll
+			// halt startup, as we can't proceed in this state.
+			return nil, nil, fmt.Errorf("btcd detected to not " +
+				"have --txindex active, cannot proceed")
+		}
+	}
+
 	return cc, cleanUp, nil
 }
 
 var (
 	// bitcoinGenesis is the genesis hash of Bitcoin's testnet chain.
 	bitcoinGenesis = chainhash.Hash([chainhash.HashSize]byte{
-		0x6f, 0xe2, 0x8c, 0x0a, 0xb6, 0xf1, 0xb3, 0x72,
-		0xc1, 0xa6, 0xa2, 0x46, 0xae, 0x63, 0xf7, 0x4f,
-		0x93, 0x1e, 0x83, 0x65, 0xe1, 0x5a, 0x08, 0x9c,
-		0x68, 0xd6, 0x19, 0x00, 0x00, 0x00, 0x00, 0x00,
+		0x43, 0x49, 0x7f, 0xd7, 0xf8, 0x26, 0x95, 0x71,
+		0x08, 0xf4, 0xa3, 0x0f, 0xd9, 0xce, 0xc3, 0xae,
+		0xba, 0x79, 0x97, 0x20, 0x84, 0xe9, 0x0e, 0xad,
+		0x01, 0xea, 0x33, 0x09, 0x00, 0x00, 0x00, 0x00,
 	})
 
 	// litecoinGenesis is the genesis hash of Litecoin's testnet4 chain.
@@ -332,6 +385,27 @@ var (
 	reverseChainMap = map[chainCode]chainhash.Hash{
 		bitcoinChain:  bitcoinGenesis,
 		litecoinChain: litecoinGenesis,
+	}
+
+	// chainDNSSeeds is a map of a chain's hash to the set of DNS seeds
+	// that will be use to bootstrap peers upon first startup.
+	//
+	// The first item in the array is the primary host we'll use to attempt
+	// the SRV lookup we require. If we're unable to receive a response
+	// over UDP, then we'll fall back to manual TCP resolution. The second
+	// item in the array is a special A record that we'll query in order to
+	// receive the IP address of the current authoritative DNS server for
+	// the network seed.
+	//
+	// TODO(roasbeef): extend and collapse these and chainparams.go into
+	// struct like chaincfg.Params
+	chainDNSSeeds = map[chainhash.Hash][][2]string{
+		bitcoinGenesis: {
+			{
+				"nodes.lightning.directory",
+				"soa.nodes.lightning.directory",
+			},
+		},
 	}
 )
 

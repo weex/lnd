@@ -1,6 +1,7 @@
 package lnwallet
 
 import (
+	"fmt"
 	"net"
 	"sync"
 
@@ -134,9 +135,10 @@ type ChannelReservation struct {
 // used only internally by lnwallet. In order to concurrent safety, the
 // creation of all channel reservations should be carried out via the
 // lnwallet.InitChannelReservation interface.
-func NewChannelReservation(capacity, fundingAmt, feePerKw btcutil.Amount,
+func NewChannelReservation(capacity, fundingAmt, commitFeePerKw btcutil.Amount,
 	wallet *LightningWallet, id uint64, pushMSat lnwire.MilliSatoshi,
-	chainHash *chainhash.Hash) *ChannelReservation {
+	chainHash *chainhash.Hash,
+	flags lnwire.FundingFlag) (*ChannelReservation, error) {
 
 	var (
 		ourBalance   lnwire.MilliSatoshi
@@ -144,7 +146,9 @@ func NewChannelReservation(capacity, fundingAmt, feePerKw btcutil.Amount,
 		initiator    bool
 	)
 
-	commitFee := btcutil.Amount((int64(feePerKw) * commitWeight) / 1000)
+	commitFee := btcutil.Amount(
+		(int64(commitFeePerKw) * CommitWeight) / 1000,
+	)
 
 	fundingMSat := lnwire.NewMSatFromSatoshis(fundingAmt)
 	capacityMSat := lnwire.NewMSatFromSatoshis(capacity)
@@ -179,6 +183,17 @@ func NewChannelReservation(capacity, fundingAmt, feePerKw btcutil.Amount,
 		initiator = true
 	}
 
+	// If we're the initiator and our starting balance within the channel
+	// after we take account of fees is below dust, then we'll reject this
+	// channel creation request.
+	//
+	// TODO(roasbeef): reject if 30% goes to fees? dust channel
+	if initiator && ourBalance.ToSatoshis() <= DefaultDustLimit() {
+		return nil, fmt.Errorf("unable to init reservation, with "+
+			"fee=%v sat/kw, local output is too small: %v sat",
+			int64(commitFee), int64(ourBalance.ToSatoshis()))
+	}
+
 	// Next we'll set the channel type based on what we can ascertain about
 	// the balances/push amount within the channel.
 	var chanType channeldb.ChannelType
@@ -205,23 +220,32 @@ func NewChannelReservation(capacity, fundingAmt, feePerKw btcutil.Amount,
 			ChannelConfig: &channeldb.ChannelConfig{},
 		},
 		partialState: &channeldb.OpenChannel{
-			ChainHash:     *chainHash,
-			Db:            wallet.Cfg.Database,
-			Capacity:      capacity,
-			IsInitiator:   initiator,
-			IsPending:     true,
-			ChanType:      chanType,
-			LocalBalance:  ourBalance,
-			RemoteBalance: theirBalance,
-			FeePerKw:      feePerKw,
-			CommitFee:     commitFee,
+			ChanType:     chanType,
+			ChainHash:    *chainHash,
+			IsPending:    true,
+			IsInitiator:  initiator,
+			ChannelFlags: flags,
+			Capacity:     capacity,
+			LocalCommitment: channeldb.ChannelCommitment{
+				LocalBalance:  ourBalance,
+				RemoteBalance: theirBalance,
+				FeePerKw:      commitFeePerKw,
+				CommitFee:     commitFee,
+			},
+			RemoteCommitment: channeldb.ChannelCommitment{
+				LocalBalance:  ourBalance,
+				RemoteBalance: theirBalance,
+				FeePerKw:      commitFeePerKw,
+				CommitFee:     commitFee,
+			},
+			Db: wallet.Cfg.Database,
 		},
 		pushMSat:      pushMSat,
 		reservationID: id,
 		chanOpen:      make(chan *openChanDetails, 1),
 		chanOpenErr:   make(chan error, 1),
 		wallet:        wallet,
-	}
+	}, nil
 }
 
 // SetNumConfsRequired sets the number of confirmations that are required for
@@ -236,16 +260,59 @@ func (r *ChannelReservation) SetNumConfsRequired(numConfs uint16) {
 	r.partialState.NumConfsRequired = numConfs
 }
 
-// RequireLocalDelay sets the mandatory CSV delay that MUST be used when
-// creating the local commitment transaction. This is distinct from the normal
-// reservation workflow as the remote party will dictate this value for us.
-//
-// TODO(roasbeef): abstract out dictation of params remote side gives
-func (r *ChannelReservation) RequireLocalDelay(csvDelay uint16) {
+// RegisterMinHTLC registers our desired amount for the smallest acceptable
+// HTLC we'll accept within this channel. Any HTLC's that are extended which
+// are below this value will SHOULD be rejected.
+func (r *ChannelReservation) RegisterMinHTLC(minHTLC lnwire.MilliSatoshi) {
+	r.Lock()
+	defer r.Unlock()
+
+	r.ourContribution.MinHTLC = minHTLC
+}
+
+// CommitConstraints takes the constraints that the remote party specifies for
+// the type of commitments that we can generate for them. These constraints
+// include several parameters that serve as flow control restricting the amount
+// of satoshis that can be transferred in a single commitment. This function
+// will also attempt to verify the constraints for sanity, returning an error
+// if the parameters are seemed unsound.
+func (r *ChannelReservation) CommitConstraints(csvDelay, maxHtlcs uint16,
+	maxValueInFlight lnwire.MilliSatoshi, chanReserve btcutil.Amount) error {
+
 	r.Lock()
 	defer r.Unlock()
 
 	r.ourContribution.ChannelConfig.CsvDelay = csvDelay
+	r.ourContribution.ChannelConfig.ChanReserve = chanReserve
+	r.ourContribution.ChannelConfig.MaxAcceptedHtlcs = maxHtlcs
+	r.ourContribution.ChannelConfig.MaxPendingAmount = maxValueInFlight
+
+	return nil
+}
+
+// RemoteChanConstraints returns our desired parameters which constraint the
+// type of commitment transactions that the remote party can extend for our
+// current state. In order to ensure that we only accept sane states, we'll
+// specify: the required reserve the remote party must uphold, the max value in
+// flight, and the maximum number of HTLC's that can propose in a state.
+func (r *ChannelReservation) RemoteChanConstraints() (btcutil.Amount, lnwire.MilliSatoshi, uint16) {
+	chanCapacity := r.partialState.Capacity
+
+	// TODO(roasbeef): move csv delay calculation into func?
+
+	// By default, we'll require them to maintain at least 1% of the total
+	// channel capacity at all times. This is the absolute amount the
+	// settled balance of the remote party must be above at *all* times.
+	chanReserve := (chanCapacity) / 100
+
+	// We'll allow them to fully utilize the full bandwidth of the channel,
+	// minus our required reserve.
+	maxValue := lnwire.NewMSatFromSatoshis(chanCapacity - chanReserve)
+
+	// Finally, we'll permit them to utilize the full channel bandwidth
+	maxHTLCs := uint16(MaxHTLCNumber / 2)
+
+	return chanReserve, maxValue, maxHTLCs
 }
 
 // OurContribution returns the wallet's fully populated contribution to the
@@ -406,7 +473,7 @@ func (r *ChannelReservation) FinalFundingTx() *wire.MsgTx {
 
 // FundingOutpoint returns the outpoint of the funding transaction.
 //
-// NOTE: The pointer returned will only be set once the .ProcesContribution()
+// NOTE: The pointer returned will only be set once the .ProcessContribution()
 // method is called in the case of the initiator of a single funder workflow,
 // and after the .CompleteReservationSingle() method is called in the case of
 // a responder to a single funder workflow.

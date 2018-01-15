@@ -113,8 +113,6 @@ func (d *databaseChannelGraph) ForEachNode(cb func(Node) error) error {
 		// addresses. As we won't be able to reach them to actually
 		// open any channels.
 		if len(n.Addresses) == 0 {
-			log.Tracef("Skipping unreachable node %x",
-				n.PubKey.SerializeCompressed())
 			return nil
 		}
 
@@ -147,8 +145,9 @@ func (d *databaseChannelGraph) addRandChannel(node1, node2 *btcec.PublicKey,
 							IP: bytes.Repeat([]byte("a"), 16),
 						},
 					},
-					Features: lnwire.NewFeatureVector(nil),
-					AuthSig:  testSig,
+					Features: lnwire.NewFeatureVector(nil,
+						lnwire.GlobalFeatures),
+					AuthSig: testSig,
 				}
 				if err := d.db.AddLightningNode(graphNode); err != nil {
 					return nil, err
@@ -172,7 +171,7 @@ func (d *databaseChannelGraph) addRandChannel(node1, node2 *btcec.PublicKey,
 					IP: bytes.Repeat([]byte("a"), 16),
 				},
 			},
-			Features: lnwire.NewFeatureVector(nil),
+			Features: lnwire.NewFeatureVector(nil, lnwire.GlobalFeatures),
 			AuthSig:  testSig,
 		}
 		if err := d.db.AddLightningNode(dbNode); err != nil {
